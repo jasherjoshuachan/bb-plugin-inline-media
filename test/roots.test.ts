@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  dataDirFromDatabaseName,
   dropsDirFromDatabaseName,
   isStrictlyInside,
   planMediaRequest,
+  relativeInside,
   resolveInsideRoot,
   type PlanInput,
 } from "../lib/roots.ts";
@@ -136,5 +138,40 @@ describe("planMediaRequest: absolute paths", () => {
   it("is case-sensitive about the folder but not the extension", () => {
     assert.equal(plan(`${DROPS.toUpperCase()}/a.mp4`).ok, false);
     assert.ok(plan(`${DROPS}/2026-10-19/A.MP4`).ok);
+  });
+});
+
+describe("planMediaRequest: absolute candidates (allowAbsolute)", () => {
+  it("plans absolute paths outside drops as candidates for the server to check", () => {
+    const result = plan("/home/someone/Movies/a.mp4", { allowAbsolute: true });
+    assert.ok(result.ok);
+    assert.equal(result.root, "absolute");
+    assert.equal(result.absolutePath, "/home/someone/Movies/a.mp4");
+    assert.equal(result.directory, "/home/someone/Movies");
+    assert.equal(result.fileName, "a.mp4");
+  });
+  it("still prefers the drops folder", () => {
+    const result = plan(`${DROPS}/2026-10-19/a.mp4`, { allowAbsolute: true });
+    assert.ok(result.ok);
+    assert.equal(result.root, "drops");
+  });
+  it("makes drops a plain candidate when drops are off", () => {
+    const result = plan(`${DROPS}/2026-10-19/a.mp4`, { allowAbsolute: true, allowDropzoneFolder: false });
+    assert.ok(result.ok);
+    assert.equal(result.root, "absolute");
+  });
+  it("keeps every path check: traversal, non-media, Windows paths", () => {
+    for (const bad of ["/a/../b.mp4", "/a/b.txt", "C:\\a.mp4", "\\\\server\\a.mp4", "/a/b/"]) {
+      assert.equal(plan(bad, { allowAbsolute: true }).ok, false, bad);
+    }
+  });
+});
+
+describe("dataDirFromDatabaseName and relativeInside", () => {
+  it("derives bb's data folder", () => {
+    assert.equal(dataDirFromDatabaseName("/data/bb/plugins/inline-media/data.db"), "/data/bb");
+  });
+  it("gives a forward-slash relative path", () => {
+    assert.equal(relativeInside("/ws", "/ws/out/a.mp4"), "out/a.mp4");
   });
 });

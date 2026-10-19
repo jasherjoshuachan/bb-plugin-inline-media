@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, before, describe, it } from "node:test";
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
-import plugin from "../server.ts";
+import plugin, { createInlineMediaServer } from "../server.ts";
 
 const HOST = "host-local";
 const THREAD = "th_1";
@@ -21,13 +21,23 @@ let base: string;
 let workspace: string;
 let storage: string;
 let outside: string;
+let home: string;
 
 before(() => {
   base = realpathSync(mkdtempSync(path.join(existsSync("/tmp") ? "/tmp" : tmpdir(), "inline-media-test-")));
   workspace = path.join(base, "ws");
   storage = path.join(base, "thread-storage");
   outside = path.join(base, "outside");
-  for (const dir of [workspace, path.join(workspace, "out"), storage, outside]) mkdirSync(dir, { recursive: true });
+  home = path.join(base, "home");
+  for (const dir of [workspace, path.join(workspace, "out"), storage, outside, path.join(home, "Movies"), path.join(home, ".ssh"), path.join(home, ".claude-work")]) {
+    mkdirSync(dir, { recursive: true });
+  }
+  writeFileSync(path.join(home, "Movies", "original.mp4"), Buffer.alloc(13));
+  writeFileSync(path.join(home, "Movies", "sibling.mp4"), Buffer.alloc(1));
+  writeFileSync(path.join(home, "top.mp4"), Buffer.alloc(1));
+  writeFileSync(path.join(home, ".ssh", "key.mp4"), Buffer.alloc(1));
+  writeFileSync(path.join(home, ".claude-work", "x.mp4"), Buffer.alloc(1));
+  symlinkSync(path.join(home, ".ssh", "key.mp4"), path.join(home, "Movies", "sneaky.mp4"));
   writeFileSync(path.join(workspace, "out", "demo.mp4"), Buffer.alloc(2048));
   writeFileSync(path.join(workspace, "out", "My Clip #1.webm"), Buffer.alloc(10));
   writeFileSync(path.join(workspace, "top.mp3"), Buffer.alloc(5));
@@ -42,8 +52,22 @@ after(() => {
   rmSync(base, { recursive: true, force: true });
 });
 
-async function setup(options: { settings?: Record<string, boolean | number>; environment?: unknown } = {}) {
+interface SetupOptions {
+  settings?: Record<string, boolean | number>;
+  environment?: unknown;
+  /** Prompt history entries (bb.sdk.threads.promptHistory). */
+  history?: unknown[];
+  /** Messages by seq (bb.sdk.threads.message). */
+  messages?: Record<number, unknown>;
+  platform?: NodeJS.Platform;
+  /** Use the default export (no test seams). */
+  plain?: boolean;
+}
+
+async function setup(options: SetupOptions = {}) {
   const previews: PreviewCall[] = [];
+  const revealed: string[] = [];
+  const historyCalls: unknown[] = [];
   let counter = 0;
   const { bb, harness } = createFakePluginHost({
     pluginId: "inline-media",
@@ -60,6 +84,15 @@ async function setup(options: { settings?: Record<string, boolean | number>; env
               : options.environment,
         }),
         storageLocation: async () => ({ hostId: HOST, storageRootPath: storage }),
+        promptHistory: async (args: unknown) => {
+          historyCalls.push(args);
+          return options.history ?? [];
+        },
+        message: async ({ seq }: { seq: number }) => {
+          const message = options.messages?.[seq];
+          if (message === undefined) throw new Error("message not found");
+          return { message, before: [], after: [] };
+        },
       },
       files: {
         createPreview: async (args: PreviewCall) => {
@@ -86,15 +119,27 @@ async function setup(options: { settings?: Record<string, boolean | number>; env
       return Reflect.get(target, key, target);
     },
   });
-  await plugin(bbProxy);
+  if (options.plain === true) {
+    await plugin(bbProxy);
+  } else {
+    await createInlineMediaServer(bbProxy, {
+      home,
+      platform: options.platform ?? "darwin",
+      revealFile: async (file) => {
+        revealed.push(file);
+      },
+    });
+  }
   const call = (input: Record<string, unknown>) =>
     harness.behavior.callRpc("mediaUrl", { threadId: THREAD, ...input }) as Promise<Record<string, unknown>>;
-  return { bb, harness, previews, call };
+  const reveal = (input: Record<string, unknown>) =>
+    harness.behavior.callRpc("reveal", { threadId: THREAD, ...input }) as Promise<Record<string, unknown>>;
+  return { bb, harness, previews, call, reveal, revealed, historyCalls };
 }
 
 describe("mediaUrl: workspace files", () => {
   it("returns a preview URL for the file's folder, with name, size and target", async () => {
-    const { call, previews } = await setup();
+    const { call, previews } = await setup({ plain: true });
     const result = await call({ path: "out/demo.mp4" });
     assert.equal(result.kind, "ok");
     assert.equal(result.url, "/preview/p1/demo.mp4");
@@ -125,6 +170,12 @@ describe("mediaUrl: workspace files", () => {
     assert.equal(previews.length, 2);
     assert.equal(refreshed.url, "/preview/p2/demo.mp4");
   });
+  it("says whether the file can be revealed in Finder", async () => {
+    assert.equal((await (await setup()).call({ path: "out/demo.mp4" })).canReveal, true);
+    assert.equal((await (await setup({ platform: "linux" })).call({ path: "out/demo.mp4" })).canReveal, false);
+    const remote = await setup({ environment: { id: "env_r", path: "/remote/ws", hostId: "host-remote" } });
+    assert.equal((await remote.call({ path: "out/demo.mp4" })).canReveal, false);
+  });
   it("reports missing files and folders as not-found without minting a preview", async () => {
     const { call, previews } = await setup();
     assert.deepEqual(await call({ path: "out/missing.mp4" }), { kind: "not-found", name: "missing.mp4" });
@@ -145,10 +196,20 @@ describe("mediaUrl: workspace files", () => {
     }
     assert.equal(previews.length, 0);
   });
-  it("refuses absolute paths outside the drops folder", async () => {
-    const { call } = await setup();
+  it("refuses absolute paths that are neither drops, workspace files nor attachments", async () => {
+    const { call, previews } = await setup();
     await assert.rejects(call({ path: path.join(outside, "secret.mp4") }), /relative to the workspace/);
-    await assert.rejects(call({ path: path.join(workspace, "out", "demo.mp4") }), /relative to the workspace/);
+    await assert.rejects(call({ path: path.join(home, "Movies", "original.mp4") }), /attached to a message/);
+    assert.equal(previews.length, 0);
+  });
+  it("serves an absolute path inside the workspace as that workspace file", async () => {
+    const { call, previews } = await setup();
+    const result = await call({ path: path.join(workspace, "out", "demo.mp4") });
+    assert.equal(result.kind, "ok");
+    assert.deepEqual(result.target, { kind: "workspace", environmentId: "env_1", path: "out/demo.mp4" });
+    assert.equal(previews[0]?.rootPath, path.join(workspace, "out"));
+    // The symlink check still applies.
+    await assert.rejects(call({ path: path.join(workspace, "out", "link.mp4") }), /outside the workspace/);
   });
   it("explains a thread without a workspace", async () => {
     const { call } = await setup({ environment: null });
@@ -205,5 +266,109 @@ describe("mediaUrl: Composer Dropzone drops", () => {
     await assert.rejects(call({ path: dropsFile("notes.txt") }));
     const partial = path.join(base, "data", "plugins", "composer-dropzone", "drops", ".partial", "u.mp4");
     await assert.rejects(call({ path: partial }));
+  });
+});
+
+describe("mediaUrl: files attached by absolute path", () => {
+  const attachedHistory = (file: string, hostId: string | undefined = HOST) => [
+    { id: "p1", createdAt: 1, input: [{ type: "text", text: "look", mentions: [] }, { type: "localFile", path: file, name: path.basename(file), ...(hostId === undefined ? {} : { hostId }) }] },
+  ];
+
+  it("serves a file the user attached to a message in this thread", async () => {
+    const file = path.join(home, "Movies", "original.mp4");
+    const { call, previews, historyCalls } = await setup({ history: attachedHistory(file) });
+    const result = await call({ path: file });
+    assert.equal(result.kind, "ok");
+    assert.equal(result.sizeBytes, 13);
+    assert.equal(result.canReveal, true);
+    assert.deepEqual(result.target, { kind: "host", hostId: HOST, path: file });
+    assert.deepEqual(previews, [{ hostId: HOST, rootPath: path.dirname(file), ttlMs: 30 * 60 * 1000 }]);
+    assert.deepEqual(historyCalls, [{ threadId: THREAD, limit: "500" }]);
+  });
+  it("requires that exact path: a sibling of an attachment is refused", async () => {
+    const { call, previews } = await setup({ history: attachedHistory(path.join(home, "Movies", "original.mp4")) });
+    await assert.rejects(call({ path: path.join(home, "Movies", "sibling.mp4") }), /attached to a message/);
+    assert.equal(previews.length, 0);
+  });
+  it("requires the attachment's host to be this bb server's machine", async () => {
+    const file = path.join(home, "Movies", "original.mp4");
+    const { call } = await setup({ history: attachedHistory(file, "host-other") });
+    await assert.rejects(call({ path: file }), /attached to a message/);
+  });
+  it("accepts an attachment of the referenced message (no host recorded there)", async () => {
+    const file = path.join(home, "Movies", "original.mp4");
+    const messages = {
+      7: { threadId: THREAD, role: "user", text: "see", attachments: { localFilePaths: [file], localFileDetails: [{ path: file, name: "original.mp4", sizeBytes: 13 }] } },
+    };
+    const { call } = await setup({ messages });
+    assert.equal((await call({ path: file, message: { seq: 7 } })).kind, "ok");
+    // Without the message reference (and no prompt history entry) it's refused.
+    await assert.rejects(call({ path: file }), /attached to a message/);
+    // A message from another thread doesn't count.
+    const other = await setup({ messages: { 7: { ...messages[7], threadId: "th_other" } } });
+    await assert.rejects(other.call({ path: file, message: { seq: 7 } }), /attached to a message/);
+  });
+  it("never serves protected locations, even when attached", async () => {
+    for (const file of [path.join(home, ".ssh", "key.mp4"), path.join(home, ".claude-work", "x.mp4")]) {
+      const { call, previews } = await setup({ history: attachedHistory(file) });
+      await assert.rejects(call({ path: file }), /protected location/, file);
+      assert.equal(previews.length, 0);
+    }
+  });
+  it("refuses an attached symlink that points into a protected location", async () => {
+    const file = path.join(home, "Movies", "sneaky.mp4");
+    const { call } = await setup({ history: attachedHistory(file) });
+    await assert.rejects(call({ path: file }), /protected location/);
+  });
+  it("refuses a file directly in the home folder (its preview would cover the home folder)", async () => {
+    const file = path.join(home, "top.mp4");
+    const { call, previews } = await setup({ history: attachedHistory(file) });
+    await assert.rejects(call({ path: file }), /private data/);
+    assert.equal(previews.length, 0);
+  });
+  it("keeps the extension allowlist and reports a missing attachment as not-found", async () => {
+    const pdf = path.join(home, "Movies", "report.pdf");
+    const gone = path.join(home, "Movies", "deleted.mp4");
+    const { call } = await setup({ history: [...attachedHistory(pdf), ...attachedHistory(gone)] });
+    await assert.rejects(call({ path: pdf }), /media file/);
+    assert.deepEqual(await call({ path: gone }), { kind: "not-found", name: "deleted.mp4" });
+  });
+  it("rejects malformed message references", async () => {
+    const { harness } = await setup();
+    for (const message of [{ seq: -1 }, { seq: 1.5 }, { seq: "1" }, { seq: 1, extra: true }]) {
+      await assert.rejects(harness.behavior.callRpc("mediaUrl", { threadId: THREAD, path: "a.mp4", message }));
+    }
+  });
+});
+
+describe("reveal", () => {
+  it("reveals a workspace file by its resolved absolute path", async () => {
+    const { reveal, revealed } = await setup();
+    assert.deepEqual(await reveal({ path: "out/demo.mp4" }), { ok: true });
+    assert.deepEqual(revealed, [path.join(workspace, "out", "demo.mp4")]);
+  });
+  it("reveals thread storage files and attached files", async () => {
+    const file = path.join(home, "Movies", "original.mp4");
+    const { reveal, revealed } = await setup({
+      history: [{ id: "p", createdAt: 1, input: [{ type: "localFile", path: file, hostId: HOST }] }],
+    });
+    await reveal({ path: "memo.m4a", source: "thread-storage" });
+    await reveal({ path: file });
+    assert.deepEqual(revealed, [path.join(storage, "memo.m4a"), file]);
+  });
+  it("uses the same confinement as mediaUrl", async () => {
+    const { reveal, revealed } = await setup();
+    for (const bad of ["../outside/secret.mp4", "out/link.mp4", path.join(outside, "secret.mp4"), path.join(home, ".ssh", "key.mp4"), "out/notes.txt", "https://e.com/a.mp4"]) {
+      await assert.rejects(reveal({ path: bad }), Error, bad);
+    }
+    await assert.rejects(reveal({ path: "out/missing.mp4" }), /not found/);
+    assert.deepEqual(revealed, []);
+  });
+  it("refuses files that aren't on this Mac", async () => {
+    const remote = await setup({ environment: { id: "env_r", path: "/remote/ws", hostId: "host-remote" } });
+    await assert.rejects(remote.reveal({ path: "out/demo.mp4" }), /only for files on the Mac/);
+    const linux = await setup({ platform: "linux" });
+    await assert.rejects(linux.reveal({ path: "out/demo.mp4" }), /only for files on the Mac/);
+    assert.deepEqual([...remote.revealed, ...linux.revealed], []);
   });
 });

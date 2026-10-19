@@ -1,8 +1,8 @@
 {
   "name": "bb-plugin-inline-media",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
-  "description": "Play videos and audio inline in bb threads: agents show a workspace media file with ::video, ::audio or ::media.",
+  "description": "Play videos and audio inline in bb threads: ::video, ::audio and ::media directives, a Play media message action, and play buttons on media file links.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -21,7 +21,7 @@
   },
   "bb": {
     "name": "Inline Media",
-    "description": "Play videos and audio inline in agent replies. Agents write ::video{file=\"out/demo.mp4\"} or ::audio{file=\"memo.m4a\"} and you get a native player. Nothing autoplays and only media files inside the thread's workspace are served.",
+    "description": "Play videos and audio inline in bb threads. Agents write ::video{file=\"out/demo.mp4\"} or ::audio{file=\"memo.m4a\"}, and Play media on any message plays the files it mentions or attaches. Nothing autoplays and only media files from the thread are served.",
     "branding": {
       "icon": "./assets/icon.svg"
     },
@@ -49,6 +49,7 @@
     "clsx": "^2.1.1",
     "cron-parser": "^5.10.2",
     "hono": "^4.13.13",
+    "linkedom": "^0.18.13",
     "sonner": "^1.7.4",
     "tailwind-merge": "^3.4.0",
     "typescript": "^5.7.0"

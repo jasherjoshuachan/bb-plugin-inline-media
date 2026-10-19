@@ -53,8 +53,8 @@ Not goals: transcoding, editing, thumbnails generated server-side (v2), side-pan
 
 ## Milestones
 1. v0.1: directive and player and `mediaUrl` RPC and skill (about 1 day). **Done** (0.1.0).
-2. v0.2: link decoration content script and settings.
-3. v0.3: poster frames (first-frame capture in the browser), keyboard shortcuts, a picture-in-picture button.
+2. v0.2: Play media message action and Media panel, link decoration content script, attached-by-path absolute files, Reveal in Finder, first-frame posters. **Done** (0.2.0).
+3. v0.3: keyboard shortcuts, a picture-in-picture button.
 
 ## Open questions
 - ~~Final directive names (`video`/`audio` vs one `media`).~~ Decided in v0.1: all three. `video` and `audio` force the element, `media` picks it from the extension.
@@ -66,3 +66,13 @@ Not goals: transcoding, editing, thumbnails generated server-side (v2), side-pan
 - `start` accepts seconds or `m:ss` / `h:mm:ss`. Booleans accept a bare attribute, `true/false`, `1/0`, `yes/no`, `on/off`.
 - An expired preview is re-minted at most once a minute after a playback error, resuming at the same position.
 - Tests: unit tests for path, root, attribute, cache and registry logic, plus `mediaUrl` behavior tests against the SDK's fake plugin host with a real temporary workspace. The frontend harness test and the headless E2E are still to do.
+
+## v0.2 notes
+- Goal: playback must not break when bb's UI changes. Three routes, two of them on stable SDK surfaces only:
+  1. Directives (`messageDirective`); the skill now asks agents to add one whenever a reply mentions a media file they produced or the user asked about or attached.
+  2. Play media (`messageAction` + `threadPanelAction`): the message is read with `useSdk().threads.message({ threadId, seq: message.experimental_messageSeq })`, and `lib/extract.ts` collects attachments (`localFileDetails`/`localFilePaths`), path and attachment mentions, directives, markdown and `file://` links, backticked and bare paths. Uploaded attachments are played from thread storage's `Attachments/<name>`. An app-overlay bridge hands the SDK client to the action so it can toast "No video or audio in this message" without opening a panel; without the bridge the panel shows that instead.
+  3. Link buttons (content script, best effort): selectors `[data-timeline-row-id] [data-markdown-preview] a[href^="file:"]`, captured from bb 0.46.1. Players render through `experimental_appOverlay` + `createPortal` so they keep the plugin's React context (`createRoot` from the shimmed `react-dom/client` would lose `useRpc`/`useSettings`). Off when that slot is missing or `decorateLinks` is off.
+- Absolute paths: besides drops, the server now serves (a) paths inside the thread's own workspace or thread storage, mapped to the relative path (bb renders every workspace link as `file:///<absolute path>`, so route 3 needs this), and (b) files the user attached by path, verified with `bb.sdk.threads.promptHistory` (`localFile` host + path, exact match, host must be the bb server's) and, with a `message: { seq }` reference, `bb.sdk.threads.message`. Protected locations are refused by path and by real path; a preview folder that is or contains the home folder or a protected folder is refused.
+- `reveal` RPC: same resolution, then `/usr/bin/open -R` with an argument vector; `mediaUrl` returns `canReveal`.
+- Posters: hidden detached muted `<video>`, seek to min(1 s, duration / 10), canvas JPEG, cached per URL; failures are silent.
+- Tests: extraction, authorization, roots, the decorator against sanitized DOM fixtures (linkedom), posters and the mount store with fakes, and `mediaUrl`/`reveal` against the SDK's fake plugin host with real temporary files.

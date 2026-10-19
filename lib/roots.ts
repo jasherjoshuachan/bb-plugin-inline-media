@@ -33,11 +33,15 @@ export function resolveInsideRoot(rootPath: string, relativePath: string): strin
 export type MediaPlan =
   | {
       ok: true;
-      /** Which root the file is served from. */
-      root: MediaSource | "drops";
+      /**
+       * Which root the file is served from. "absolute" is an absolute path
+       * outside the drops folder: the server still has to map it into the
+       * thread's workspace or find it among the thread's attachments.
+       */
+      root: MediaSource | "drops" | "absolute";
       /** For workspace and thread-storage: the path relative to that root. */
       relativePath: string | null;
-      /** For drops: the absolute file path. */
+      /** For drops and absolute: the absolute file path. */
       absolutePath: string | null;
       /** Directory to create the preview for: relative to the root, or absolute for drops. */
       directory: string;
@@ -51,6 +55,8 @@ export interface PlanInput {
   source: MediaSource;
   dropsDir: string | null;
   allowDropzoneFolder: boolean;
+  /** Plan other absolute paths as root "absolute" instead of refusing them (default false). */
+  allowAbsolute?: boolean;
 }
 
 /**
@@ -75,22 +81,36 @@ export function planMediaRequest(input: PlanInput): MediaPlan {
     };
   }
 
-  // Absolute: only Composer Dropzone's drops folder, on this machine.
-  if (!input.allowDropzoneFolder || input.dropsDir === null) {
-    return { ok: false, message: '"file" must be relative to the workspace, not an absolute path.' };
-  }
+  // Absolute: Composer Dropzone's drops folder on this machine, or (when the
+  // caller allows it) a candidate the server checks against the thread.
   if (path.sep === "/" && (check.path.includes("\\") || /^[a-zA-Z]:/.test(check.path))) {
     return { ok: false, message: '"file" must be relative to the workspace, not an absolute path.' };
   }
   const absolutePath = path.resolve(check.path);
-  if (!isStrictlyInside(input.dropsDir, absolutePath)) {
+  const inDrops = input.allowDropzoneFolder && input.dropsDir !== null && isStrictlyInside(input.dropsDir, absolutePath);
+  if (!inDrops) {
+    if (input.allowAbsolute === true) {
+      return {
+        ok: true,
+        root: "absolute",
+        relativePath: null,
+        absolutePath,
+        directory: path.dirname(absolutePath),
+        fileName: path.basename(absolutePath),
+        mediaKind: check.mediaKind,
+      };
+    }
+    if (!input.allowDropzoneFolder || input.dropsDir === null) {
+      return { ok: false, message: '"file" must be relative to the workspace, not an absolute path.' };
+    }
     return {
       ok: false,
       message: '"file" must be relative to the workspace. The only absolute paths allowed are Composer Dropzone drops.',
     };
   }
+  const dropsDir = input.dropsDir!;
   // Never serve the in-progress upload folder.
-  const rel = path.relative(path.resolve(input.dropsDir), absolutePath);
+  const rel = path.relative(path.resolve(dropsDir), absolutePath);
   if (rel.split(path.sep).some((segment) => segment.startsWith("."))) {
     return { ok: false, message: "Hidden files in the drops folder are not served." };
   }
@@ -103,4 +123,14 @@ export function planMediaRequest(input: PlanInput): MediaPlan {
     fileName: path.basename(absolutePath),
     mediaKind: check.mediaKind,
   };
+}
+
+/** bb's data folder, derived from this plugin's database path (<dataDir>/plugins/<id>/<file>). */
+export function dataDirFromDatabaseName(databaseName: string): string {
+  return path.dirname(path.dirname(path.dirname(databaseName)));
+}
+
+/** `root`-relative path with forward slashes, for a file already known to be strictly inside `root`. */
+export function relativeInside(root: string, filePath: string): string {
+  return path.relative(path.resolve(root), path.resolve(filePath)).split(path.sep).join("/");
 }

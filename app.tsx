@@ -1,37 +1,68 @@
 // Inline Media — frontend.
 //
-// Registers three message directives — ::video, ::audio and ::media — that
-// render a native player for a workspace (or thread-storage) media file.
-// Attributes are untrusted: they're validated here for a quick inline error
-// and again on the server, which is the only place that touches files.
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+// Three ways to play a media file, from most to least stable:
+// 1. Message directives ::video, ::audio and ::media in agent replies
+//    (app.slots.messageDirective).
+// 2. A "Play media" message action on any message (app.slots.messageAction):
+//    it reads the message through the SDK (useSdk().threads.message), finds
+//    every media file it refers to and lists them in a "Media" side panel
+//    (app.slots.threadPanelAction).
+// 3. Best effort: a ▶ button after media file links in rendered messages
+//    (a content script reading bb's DOM, rendered through an app overlay
+//    bridge). Off with the decorateLinks setting; does nothing if bb's markup
+//    changes.
+// Everything that names a file is untrusted: it's validated here for a quick
+// inline error and again on the server, the only place that touches files.
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type ReactNode,
+} from "react";
+import { createPortal } from "react-dom";
 import {
   definePluginApp,
   experimental_copyToClipboard,
   useBbNavigate,
   useRpc,
+  useSdk,
   useSettings,
   type ExperimentalLiveFileTarget,
+  type PluginBrowserBbSdk,
+  type PluginContentScriptContext,
+  type PluginMessageActionContext,
   type PluginMessageDirectiveProps,
+  type PluginThreadPanelProps,
 } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
 import type { rpcContract } from "./server";
 import { Icon } from "./components/ui/icon";
 import { parseMediaAttributes, type MediaOptions } from "./lib/attributes";
+import { extractFromText, extractMediaRefs, type MediaRef } from "./lib/extract";
 import { formatBytes, formatDuration } from "./lib/format";
+import { createLinkDecorator, threadIdFromLocation, type LinkDecorator } from "./lib/link-decorator";
 import type { DirectiveName } from "./lib/media";
+import { createMountStore, type InlineMountRequest } from "./lib/mount-store";
 import { isAbsoluteLike } from "./lib/paths";
 import { createPlaybackRegistry } from "./lib/playback";
+import { cachedPoster, capturePoster } from "./lib/poster";
 import { cn } from "./lib/utils";
 
 const DEFAULT_MAX_HEIGHT = 420;
 const playback = createPlaybackRegistry();
+
+const PANEL_ACTION_ID = "media";
+const NO_MEDIA = "No video or audio in this message";
 
 type Loaded = {
   url: string;
   name: string;
   sizeBytes: number | null;
   target: ExperimentalLiveFileTarget | null;
+  canReveal: boolean;
 };
 
 type LoadState =
@@ -140,10 +171,13 @@ function MediaPlayer({
   options,
   threadId,
   openWorkspaceFile,
+  messageSeq = null,
 }: {
   options: MediaOptions;
   threadId: string;
   openWorkspaceFile: PluginMessageDirectiveProps["openWorkspaceFile"];
+  /** The message the file came from, so the server can check its attachments. */
+  messageSeq?: number | null;
 }) {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
@@ -152,6 +186,7 @@ function MediaPlayer({
   const [duration, setDuration] = useState<number | null>(null);
   const [playError, setPlayError] = useState<PlayError | null>(null);
   const [noPicture, setNoPicture] = useState(false);
+  const [poster, setPoster] = useState<string | null>(null);
   const elementRef = useRef<HTMLMediaElement | null>(null);
   /** When the URL was last re-minted after a playback error; limits refreshes to one a minute. */
   const lastRefreshRef = useRef<number | null>(null);
@@ -167,6 +202,7 @@ function MediaPlayer({
           threadId,
           path: options.file,
           source: options.source,
+          ...(messageSeq === null ? {} : { message: { seq: messageSeq } }),
           ...(refresh ? { refresh: true } : {}),
         });
         if (isCancelled()) return;
@@ -176,13 +212,20 @@ function MediaPlayer({
         }
         setState({
           status: "ready",
-          media: { url: result.url, name: result.name, sizeBytes: result.sizeBytes, target: result.target },
+          media: {
+            url: result.url,
+            name: result.name,
+            sizeBytes: result.sizeBytes,
+            target: result.target,
+            canReveal: result.canReveal === true,
+          },
         });
+        if (options.kind === "video") setPoster(cachedPoster(result.url) ?? null);
       } catch (error) {
         if (!isCancelled()) setState({ status: "error", message: errorMessage(error) });
       }
     },
-    [rpc, threadId, options.file, options.source],
+    [rpc, threadId, options.file, options.source, options.kind, messageSeq],
   );
 
   useEffect(() => {
@@ -192,6 +235,7 @@ function MediaPlayer({
     setPlayError(null);
     setNoPicture(false);
     setDuration(null);
+    setPoster(null);
     setState({ status: "loading" });
     void load(false, () => cancelled);
     return () => {
@@ -240,7 +284,15 @@ function MediaPlayer({
     }
     if (options.kind === "video" && element instanceof HTMLVideoElement) {
       // Audio decoded but no picture: typically HEVC/ProRes without hardware support.
-      setNoPicture(element.videoWidth === 0 && element.videoHeight === 0);
+      const pictureless = element.videoWidth === 0 && element.videoHeight === 0;
+      setNoPicture(pictureless);
+      // First-frame poster from a hidden copy; never touches this element's playback.
+      const url = element.currentSrc || element.src;
+      if (!pictureless && url && cachedPoster(url) === undefined) {
+        void capturePoster(url).then((frame) => {
+          if (mountedRef.current && frame !== null && elementRef.current === element) setPoster(frame);
+        });
+      }
     }
   }, [options.start, options.kind]);
 
@@ -302,6 +354,20 @@ function MediaPlayer({
     }
   }, [target, navigate]);
 
+  const canReveal = media?.canReveal === true;
+  const reveal = useCallback(async () => {
+    try {
+      await rpc.call("reveal", {
+        threadId,
+        path: options.file,
+        source: options.source,
+        ...(messageSeq === null ? {} : { message: { seq: messageSeq } }),
+      });
+    } catch (error) {
+      toast.error(`Couldn't reveal the file: ${errorMessage(error)}`);
+    }
+  }, [rpc, threadId, options.file, options.source, messageSeq]);
+
   const copyPath = useCallback(async () => {
     const text = options.file;
     let copied = false;
@@ -323,6 +389,7 @@ function MediaPlayer({
     lastRefreshRef.current = Date.now();
     setPlayError(null);
     setNoPicture(false);
+    setPoster(null);
     setState({ status: "loading" });
     void load(true, () => !mountedRef.current);
   }, [load]);
@@ -341,6 +408,11 @@ function MediaPlayer({
       {canOpenExternally ? (
         <IconButton icon="ExternalLink" label="Open in another app" onClick={openExternally}>
           Open in another app
+        </IconButton>
+      ) : null}
+      {canReveal ? (
+        <IconButton icon="FolderOpen" label="Reveal in Finder" onClick={() => void reveal()}>
+          Reveal in Finder
         </IconButton>
       ) : null}
       <IconButton icon="RotateCcw" label="Try again" onClick={retry}>
@@ -387,6 +459,7 @@ function MediaPlayer({
             ref={attach}
             {...common}
             playsInline
+            {...(poster === null ? {} : { poster })}
             className="block w-full bg-black object-contain"
             style={{ maxHeight }}
           />
@@ -419,6 +492,7 @@ function MediaPlayer({
         ) : null}
         <span className="ml-auto flex shrink-0 items-center">
           {canOpenPanel ? <IconButton icon="PanelRight" label="Open in side panel" onClick={openPanel} /> : null}
+          {canReveal ? <IconButton icon="FolderOpen" label="Reveal in Finder" onClick={() => void reveal()} /> : null}
           <IconButton icon="Copy" label="Copy path" onClick={() => void copyPath()} />
         </span>
       </div>
@@ -440,8 +514,233 @@ function directiveComponent(directive: DirectiveName) {
   return MediaDirective;
 }
 
+// ---------------------------------------------------------------------------
+// Route 2: the "Play media" message action and its side panel.
+
+/** The panel's params: `{ messageSeq }`. Untrusted (persisted with the tab). */
+function panelMessageSeq(params: unknown): number | null {
+  if (typeof params !== "object" || params === null || Array.isArray(params)) return null;
+  const seq = (params as Record<string, unknown>).messageSeq;
+  return typeof seq === "number" && Number.isSafeInteger(seq) && seq >= 0 ? seq : null;
+}
+
+/** A reference from a message, as player options (validated like a directive). */
+function refOptions(ref: MediaRef): MediaOptions | null {
+  const parsed = parseMediaAttributes({ file: ref.file, source: ref.source }, ref.kind);
+  if (!parsed.ok) return null;
+  return { ...parsed.value, title: ref.name };
+}
+
+type PanelState =
+  | { status: "loading" }
+  | { status: "ready"; refs: MediaRef[] }
+  | { status: "error"; message: string };
+
+function MediaPanel({ threadId, params }: PluginThreadPanelProps) {
+  const sdk = useSdk();
+  const messageSeq = panelMessageSeq(params);
+  const [state, setState] = useState<PanelState>({ status: "loading" });
+
+  useEffect(() => {
+    if (messageSeq === null) return;
+    let cancelled = false;
+    setState({ status: "loading" });
+    sdk.threads
+      .message({ threadId, seq: messageSeq })
+      .then((result) => {
+        if (!cancelled) setState({ status: "ready", refs: extractMediaRefs(result.message) });
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) setState({ status: "error", message: `Couldn't read this message: ${errorMessage(error)}` });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sdk, threadId, messageSeq]);
+
+  if (messageSeq === null) {
+    return (
+      <InlineNotice tone="info">
+        Open a message's actions and choose Play media to list its videos and audio here.
+      </InlineNotice>
+    );
+  }
+  if (state.status === "loading") return <InlineNotice tone="info">Looking for media in this message…</InlineNotice>;
+  if (state.status === "error") return <InlineNotice tone="error">{state.message}</InlineNotice>;
+  const items = state.refs
+    .map((ref) => ({ ref, options: refOptions(ref) }))
+    .filter((item): item is { ref: MediaRef; options: MediaOptions } => item.options !== null);
+  if (items.length === 0) return <InlineNotice tone="info">{NO_MEDIA}.</InlineNotice>;
+  return (
+    <div className="flex flex-col gap-1" data-inline-media-panel="">
+      <div className="text-xs text-muted-foreground">
+        {items.length === 1 ? "1 media file" : `${items.length} media files`} in this message
+      </div>
+      {items.map(({ ref, options }) => (
+        <MediaPlayer
+          key={`${ref.source}:${ref.file}`}
+          options={options}
+          threadId={threadId}
+          openWorkspaceFile={null}
+          messageSeq={messageSeq}
+        />
+      ))}
+    </div>
+  );
+}
+
+function messageSeqOf(context: PluginMessageActionContext): number {
+  const seq = context.message.experimental_messageSeq;
+  return typeof seq === "number" ? seq : context.message.sourceSeqEnd;
+}
+
+async function playMediaAction(context: PluginMessageActionContext): Promise<void> {
+  const seq = messageSeqOf(context);
+  // With the SDK client from the bridge, decide up front; without it, the
+  // panel reads the message itself.
+  let refs: MediaRef[] | null = null;
+  const sdk = bridge.sdk;
+  if (sdk !== null) {
+    try {
+      const result = await sdk.threads.message({ threadId: context.threadId, seq });
+      refs = extractMediaRefs(result.message);
+    } catch {
+      refs = null;
+    }
+  }
+  if (refs === null && context.message.role === "assistant" && extractFromText(context.message.text).length === 0) {
+    refs = [];
+  }
+  if (refs !== null && refs.length === 0) {
+    toast(NO_MEDIA);
+    return;
+  }
+  const opened = context.openPanel({ actionId: PANEL_ACTION_ID, title: "Media", params: { messageSeq: seq } });
+  if (!opened) toast.error("bb couldn't open the Media panel here.");
+}
+
+// ---------------------------------------------------------------------------
+// Route 3 (best effort): ▶ buttons after media file links.
+
+const mounts = createMountStore();
+
+/** Shared between the overlay bridge (React) and the content script (DOM). */
+const bridge = (() => {
+  let sdk: PluginBrowserBbSdk | null = null;
+  let enabled = false;
+  const listeners = new Set<() => void>();
+  return {
+    get sdk() {
+      return sdk;
+    },
+    setSdk(next: PluginBrowserBbSdk | null) {
+      sdk = next;
+    },
+    get enabled() {
+      return enabled;
+    },
+    setEnabled(next: boolean) {
+      if (enabled === next) return;
+      enabled = next;
+      for (const listener of [...listeners]) listener();
+    },
+    subscribe(listener: () => void) {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+  };
+})();
+
+function LinkPlayer({ request }: { request: InlineMountRequest }) {
+  const options = useMemo(() => {
+    const parsed = parseMediaAttributes({ file: request.file }, request.kind);
+    return parsed.ok ? parsed.value : null;
+  }, [request.file, request.kind]);
+  if (options === null) return null;
+  return (
+    <MediaPlayer options={options} threadId={request.threadId} openWorkspaceFile={null} messageSeq={request.messageSeq} />
+  );
+}
+
+/**
+ * Mounted once per window (experimental_appOverlay). Renders the link players
+ * into the containers the content script inserted, through portals, so they
+ * keep this plugin's React context. Also hands the SDK client to the message
+ * action and switches the link decorator on and off with its setting.
+ */
+function InlineMediaBridge() {
+  const sdk = useSdk();
+  const { values } = useSettings();
+  const decorate = values !== undefined && values.decorateLinks !== false;
+  useEffect(() => {
+    bridge.setSdk(sdk);
+    return () => bridge.setSdk(null);
+  }, [sdk]);
+  useEffect(() => {
+    bridge.setEnabled(decorate);
+    return () => bridge.setEnabled(false);
+  }, [decorate]);
+  const list = useSyncExternalStore(mounts.subscribe, mounts.list, mounts.list);
+  return <>{list.map((mount) => createPortal(<LinkPlayer request={mount.request} />, mount.container, String(mount.id)))}</>;
+}
+
+function mountLinkDecorator({ signal }: PluginContentScriptContext): () => void {
+  let decorator: LinkDecorator | null = null;
+  const stop = () => {
+    decorator?.dispose();
+    decorator = null;
+    mounts.clear();
+  };
+  const sync = () => {
+    try {
+      if (!bridge.enabled || signal.aborted) {
+        stop();
+        return;
+      }
+      if (decorator !== null || typeof document === "undefined" || document.body === null) return;
+      decorator = createLinkDecorator({
+        root: document.body,
+        document,
+        signal,
+        fallbackThreadId: () => threadIdFromLocation(window.location.pathname),
+        open: (match, container) => {
+          mounts.add(container, {
+            threadId: match.threadId,
+            file: match.path,
+            name: match.name,
+            kind: match.kind,
+            messageSeq: match.messageSeq,
+          });
+        },
+        close: (container) => mounts.removeContainer(container),
+      });
+    } catch {
+      stop();
+    }
+  };
+  const unsubscribe = bridge.subscribe(sync);
+  sync();
+  const dispose = () => {
+    unsubscribe();
+    stop();
+  };
+  signal.addEventListener("abort", dispose, { once: true });
+  return dispose;
+}
+
 export default definePluginApp((app) => {
+  // Route 1: directives in agent replies.
   for (const id of ["video", "audio", "media"] as const) {
     app.slots.messageDirective({ id, component: directiveComponent(id) });
+  }
+  // Route 2: "Play media" on any message, listing its media in a side panel.
+  app.slots.threadPanelAction({ id: PANEL_ACTION_ID, title: "Media", icon: "Play", component: MediaPanel });
+  app.slots.messageAction({ id: "play-media", title: "Play media", icon: "Play", run: playMediaAction });
+  // Route 3 (best effort): needs the experimental overlay slot as its React bridge.
+  if (typeof app.slots.experimental_appOverlay === "function") {
+    app.slots.experimental_appOverlay({ id: "inline-media-bridge", component: InlineMediaBridge });
+    app.contentScripts.register({ id: "inline-media-links", mount: mountLinkDecorator });
   }
 });
