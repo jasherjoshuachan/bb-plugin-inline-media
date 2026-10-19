@@ -15,7 +15,7 @@ Not goals: transcoding, editing, thumbnails generated server-side (v2), side-pan
 ### 1. Directive (stable SDK surface)
 - `app.slots.messageDirective({ id: "video" | "audio" | "media", component })`.
 - Attributes (all untrusted): `file` (required), `source` (`workspace` default, `thread-storage`), `title`, `start` (seconds), `loop`, `muted`.
-- Renders only in assistant and nested-agent messages (bb's rule). Unknown or invalid attributes fall back to bb's plain text.
+- Renders only in assistant and nested-agent messages (bb's rule). Invalid attributes render a small inline error that quotes the original directive. (v0.1: unknown attributes are ignored rather than rejected, so a newer skill can add optional ones without breaking older installs.)
 - A bundled skill (`skills/inline-media/SKILL.md`) tells agents when to emit the directive (after rendering a video, recording a screen capture, generating audio) and the exact syntax.
 
 ### 2. Local-link playback (content script, best effort)
@@ -52,10 +52,17 @@ Not goals: transcoding, editing, thumbnails generated server-side (v2), side-pan
 - E2E: headless Chrome against the local bb (same approach as composer-dropzone): a reply containing the directive, a message with a media link, seeking (range requests), and an expired URL refresh.
 
 ## Milestones
-1. v0.1: directive and player and `mediaUrl` RPC and skill (about 1 day).
+1. v0.1: directive and player and `mediaUrl` RPC and skill (about 1 day). **Done** (0.1.0).
 2. v0.2: link decoration content script and settings.
 3. v0.3: poster frames (first-frame capture in the browser), keyboard shortcuts, a picture-in-picture button.
 
 ## Open questions
-- Final directive names (`video`/`audio` vs one `media`).
+- ~~Final directive names (`video`/`audio` vs one `media`).~~ Decided in v0.1: all three. `video` and `audio` force the element, `media` picks it from the extension.
 - Submit both plugins to the bb-community marketplace once they've had a week of daily use?
+
+## v0.1 notes
+- `mediaUrl` also returns `sizeBytes` (read locally when the file is on the bb server's machine, `null` for remote hosts), `expiresAtMs`, and a live-file `target` for bb's side panel.
+- On the bb server's machine the server resolves symlinks and refuses files whose real path leaves the root, and reports missing files as `not-found` without minting a preview.
+- `start` accepts seconds or `m:ss` / `h:mm:ss`. Booleans accept a bare attribute, `true/false`, `1/0`, `yes/no`, `on/off`.
+- An expired preview is re-minted at most once a minute after a playback error, resuming at the same position.
+- Tests: unit tests for path, root, attribute, cache and registry logic, plus `mediaUrl` behavior tests against the SDK's fake plugin host with a real temporary workspace. The frontend harness test and the headless E2E are still to do.

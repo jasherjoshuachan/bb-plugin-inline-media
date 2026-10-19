@@ -1,0 +1,56 @@
+{
+  "name": "bb-plugin-inline-media",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Play videos and audio inline in bb threads: agents show a workspace media file with ::video, ::audio or ::media.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jasherjoshuachan/bb-plugin-inline-media.git"
+  },
+  "keywords": [
+    "bb",
+    "bb-plugin",
+    "video",
+    "audio",
+    "media"
+  ],
+  "engines": {
+    "bb": ">=0.46",
+    "bbPluginSdk": ">=0.6.49"
+  },
+  "bb": {
+    "name": "Inline Media",
+    "description": "Play videos and audio inline in agent replies. Agents write ::video{file=\"out/demo.mp4\"} or ::audio{file=\"memo.m4a\"} and you get a native player. Nothing autoplays and only media files inside the thread's workspace are served.",
+    "branding": {
+      "icon": "./assets/icon.svg"
+    },
+    "server": "./server.ts",
+    "app": "./app.tsx",
+    "skills": [
+      "skills"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc -p .",
+    "test": "node --test test/*.test.ts",
+    "build": "bb plugin build"
+  },
+  "dependencies": {
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "0.6.49",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "better-sqlite3": "^12.11.1",
+    "clsx": "^2.1.1",
+    "cron-parser": "^5.10.2",
+    "hono": "^4.13.13",
+    "sonner": "^1.7.4",
+    "tailwind-merge": "^3.4.0",
+    "typescript": "^5.7.0"
+  }
+}
